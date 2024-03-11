@@ -1,0 +1,203 @@
+#!/usr/bin/env python3
+
+from googleapiclient import discovery
+from oauth2client.client import GoogleCredentials
+import argparse
+import sqlite3
+import os.path
+import sys
+
+
+
+class argParser(argparse.ArgumentParser):
+    # Patch argparse to print full help when a param is wrong
+    def error(self, message):
+        print('Error: %s\n' % message, file=sys.stderr)
+        self.print_help()
+        exit(2)
+
+
+def update(dbpath):
+    # Update database function
+
+    try:
+        credentials = GoogleCredentials.get_application_default()
+        service = discovery.build('iam', 'v1', credentials=credentials)
+    except Exception as e:
+        print("[!] Problem with the Application default credentials", file=sys.stderr )
+        print(e)
+        exit(1)
+
+    try:
+        response = service.roles().list(view="FULL", pageSize="100").execute()
+        roles = []
+        if 'roles' in response:
+            roles.extend(response['roles'])
+        while 'nextPageToken' in response:
+            print("[i] Found " + str(len(roles)) + " so far, getting more...",
+                  end='\r')
+            page_token = response['nextPageToken']
+            response = service.roles().list(
+                view="FULL",
+                pageSize="100",
+                pageToken=page_token).execute()
+            if 'roles' in response:
+                roles.extend(response['roles'])
+        print("\n[i] Found: " + str(len(roles)) + " roles")
+    except Exception as e:
+        print("[!] Issue performing API call...")
+        print(e)
+        exit(1)
+
+    db = sqlite3.connect(dbpath)
+
+    roledb = db.cursor()
+    try:
+        roledb.execute("""CREATE TABLE IF NOT EXISTS Roles
+                       (role TEXT PRIMARY Key,
+                       title TEXT,
+                       stage TEXT,
+                       etag TEXT,
+                       description TEXT,
+                       includedPermissions TEXT,
+                       lastUpdate TEXT DEFAULT CURRENT_TIMESTAMP,
+                       UNIQUE(role))""")
+    except Exception as err:
+        print(err)
+
+    absentpermissions = []
+    absentstage = []
+    absentdescription = []
+
+    for role in roles:
+
+        includedperms = role.get('includedPermissions', None)
+        if includedperms is None:
+            absentpermissions.append(role['name'])
+
+        else:
+            includedperms = ", ".join(str(x)
+                                      for x in role['includedPermissions'])
+        stage = role.get('stage', None)
+        if stage is None:
+            absentstage.append(role['name'])
+
+        description = role.get('description', None)
+        if description is None:
+            absentdescription.append(role['name'])
+
+        roledb.execute("""INSERT OR REPLACE INTO Roles
+                       (role, title, stage,
+                       etag, includedPermissions, description)
+                       VALUES (?, ?, ?, ?, ?, ?)""",
+                       (role['name'],
+                        role['title'],
+                        stage,
+                        role['etag'],
+                        includedperms,
+                        description))
+
+    db.commit()
+    db.close()
+
+    # Nicer output for missing data.
+    # Send to stderr as its technically error data
+    if len(absentstage) >= 1:
+        print("\nNo Launch stage info provided for:", file=sys.stderr)
+        for s in absentstage:
+            print(s, file=sys.stderr)
+    if len(absentpermissions) >= 1:
+        print("\nNo Permissions provided for:", file=sys.stderr)
+        for p in absentpermissions:
+            print(p, file=sys.stderr)
+    if len(absentdescription) >= 1:
+        print("\nNo Descriptions provided for:", file=sys.stderr)
+        for d in absentdescription:
+            print(d, file=sys.stderr)
+
+
+def find(permissions, dbfile, stage):
+    # Find Role Function
+
+    db = sqlite3.connect(dbfile)
+    roledb = db.cursor()
+
+    match stage:
+        case None:
+            stagematch = ""
+        case "NULL":
+            stagematch = "and stage is NULL"
+        case _:
+            stagematch = "and stage = '" + stage + "'"
+
+    for permission in permissions:
+        try:
+            roledb.execute("""SELECT role from Roles
+                           where includedPermissions
+                           like '%{}%' {} """.format(permission, stagematch))
+        except Exception as e:
+            print(e)
+
+        rows = roledb.fetchall()
+        print("Found", str(len(rows)), "Roles containing '{}'"
+              .format(permission), file=sys.stderr)
+        for row in rows:
+            print(row[0])
+
+    db.close()
+
+
+def main():
+    ## Main function
+    
+    if 'ROLES_DB' in os.environ:
+        roledb = { 'default': os.environ['ROLES_DB'] }
+    else:
+        roledb = { 'default': 'roles.db' }
+
+    parser = argParser(
+        description="""GCP Role finder -
+         a command line tool for finding out which
+          Google Cloud Roles contain a given permission.""")
+
+    action = parser.add_mutually_exclusive_group(required=True)
+
+    action.add_argument('-f', '--find',
+                        metavar='role',
+                        help='Find which role contains a permission',
+                        action='append')
+
+    action.add_argument('-u', '--update',
+                        help='Update the local role database',
+                        action='store_true')
+
+    parser.add_argument('--db',
+                        help='''DB file for storing role and permissions info
+                        (Currently: %(default)s)''',
+                        metavar='database',
+                        **roledb)
+    parser.add_argument('-s', '--stage',
+                        metavar='Stage',
+                        help='''Find Role based on its launch stage.
+                         Choose one of %(choices)s
+                         (Default: %(default)s)''',
+                        choices=['GA', 'BETA', 'ALPHA',
+                                 'EAP', 'DISABLED', 'DEPRECATED', 'NULL'],
+                        default=None)
+
+    args = parser.parse_args()
+
+    if not os.path.isfile(args.db) and not args.update:
+        print("""DB file '{}' not found. Recommend performing an update"""
+              .format(args.db))
+        exit(1)
+
+    if args.update:
+        update(args.db)
+
+    if args.find:
+        find(args.find, args.db, args.stage)
+
+
+if __name__ == '__main__':
+    main()
